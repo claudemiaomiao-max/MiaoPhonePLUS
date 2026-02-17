@@ -12077,7 +12077,7 @@ ${memoryText}`;
                                 language: 'zh_cn',
                                 domain: 'iat',
                                 accent: 'mandarin',
-                                vad_eos: 3000,
+                                vad_eos: 60000,
                                 dwa: 'wpgs',
                                 ptt: 1
                             };
@@ -12105,7 +12105,7 @@ ${memoryText}`;
                 };
 
                 xfyunWs.onclose = () => {
-                    console.log('讯飞 WebSocket 关闭');
+                    console.log('讯飞 WebSocket 关闭（60秒到期或手动停止）');
                     // 把当前未合并的结果存入 pendingText
                     const keys = Object.keys(xfyunResults).map(Number).sort((a, b) => a - b);
                     const remainText = keys.map(k => xfyunResults[k]).join('');
@@ -12115,14 +12115,12 @@ ${memoryText}`;
                     // 清理音频资源
                     xfCleanupAudio();
 
-                    // 如果用户还在录音，自动重连（讯飞单次最长60秒）
+                    // 60秒到期：结束录音，图标变灰，用户想继续说可以再点麦克风
                     if (voiceRecognition?.type === 'xfyun') {
-                        console.log('讯飞会话结束，自动重连...');
-                        setTimeout(() => {
-                            if (voiceRecognition?.type === 'xfyun') {
-                                startXfyunVoiceInput();
-                            }
-                        }, 300);
+                        voiceRecognition = null;
+                        document.querySelectorAll('.wechat-voice-btn.recording').forEach(b => b.classList.remove('recording'));
+                        resetAudioRoute();
+                        console.log('讯飞识别已结束，点击麦克风可继续');
                     }
                 };
 
