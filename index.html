@@ -16548,6 +16548,7 @@ ${dialogueText}
             const el = document.getElementById('vcInput');
             el.style.height = 'auto';
             el.style.height = Math.min(el.scrollHeight, 84) + 'px';
+            el.scrollTop = el.scrollHeight;
         }
 
         // ---- 通话计时器 ----
@@ -17140,6 +17141,12 @@ ${dialogueText}
             let fullContent = systemPrompt + '\n\n=====对话记录=====\n';
 
             // 携带微信上下文
+            console.log('语音通话上下文检查:', {
+                carryWechatContext: voiceCallData.settings.carryWechatContext,
+                assistantId: vcState.assistantId,
+                hasConv: !!conv,
+                msgCount: conv?.messages?.length || 0
+            });
             if (voiceCallData.settings.carryWechatContext && conv?.messages?.length) {
                 const ctxCount = voiceCallData.settings.contextCount || 30;
                 const ctxMsgs = conv.messages.slice(-ctxCount);
@@ -17166,38 +17173,109 @@ ${dialogueText}
         // 解析AI回复
         function vcParseReply(content) {
             let trimmed = content.trim();
-            // 清理思考标签
+
+            // 第一步：清理思考标签和干扰内容
             trimmed = trimmed.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
             trimmed = trimmed.replace(/<think>[\s\S]*?<\/think>/gi, '');
-            trimmed = trimmed.replace(/```(?:json)?\s*/gi, '').replace(/\s*```/g, '');
+            trimmed = trimmed.replace(/```thinking[\s\S]*?```/gi, '');
+            trimmed = trimmed.replace(/[\[【]思考[\]】][\s\S]*?[\[【]\/思考[\]】]/gi, '');
             trimmed = trimmed.trim();
 
+            if (!trimmed) {
+                console.warn('清理思考链后内容为空，使用原始内容');
+                trimmed = content.trim();
+            }
+
             const results = [];
+
+            // 第二步：尝试标准 JSON 解析
             try {
+                // 处理代码块格式
+                if (trimmed.includes('```')) {
+                    trimmed = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+                    console.log('语音通话：检测到代码块格式，已去除标记');
+                }
+
                 let arr;
                 if (trimmed.startsWith('[')) {
                     arr = JSON.parse(trimmed);
                 } else {
-                    const match = trimmed.match(/\[[\s\S]*\]/);
+                    // AI 可能在 JSON 前面加了废话
+                    const match = trimmed.match(/\[[\s\S]*?\](?=\s*$|\s*```)/) || trimmed.match(/\[[\s\S]*\]/);
                     arr = match ? JSON.parse(match[0]) : null;
                 }
 
                 if (Array.isArray(arr)) {
                     for (const item of arr) {
+                        if (item.type === 'thinking') continue;
                         if (item.type === 'voice_message' && item.content) {
                             results.push({ content: item.content, emotion: item.emotion || 'neutral' });
-                        } else if (item.type === 'text' && item.content && item.type !== 'thinking') {
-                            results.push({ content: item.content, emotion: 'neutral' });
+                        } else if (item.content) {
+                            results.push({ content: item.content, emotion: item.emotion || 'neutral' });
                         }
                     }
                 }
+
+                if (results.length > 0) {
+                    console.log(`语音通话：成功解析${results.length}条回复`);
+                }
             } catch(e) {
-                console.warn('语音通话JSON解析失败:', e);
+                console.warn('语音通话JSON标准解析失败:', e.message);
+
+                // 第三步：容错 —— 尝试修复不完整 JSON
+                try {
+                    let fixAttempt = trimmed;
+                    fixAttempt = fixAttempt.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+
+                    // 缺少闭合括号的情况
+                    if (fixAttempt.startsWith('[') && !fixAttempt.endsWith(']')) {
+                        const lastObj = fixAttempt.lastIndexOf('}');
+                        if (lastObj > 0) {
+                            fixAttempt = fixAttempt.substring(0, lastObj + 1) + ']';
+                            const arr = JSON.parse(fixAttempt);
+                            for (const item of arr) {
+                                if (item.type === 'thinking') continue;
+                                if (item.content) {
+                                    results.push({ content: item.content, emotion: item.emotion || 'neutral' });
+                                }
+                            }
+                            console.log(`语音通话容错：修复后解析到${results.length}条回复`);
+                        }
+                    }
+
+                    // 逐个提取 JSON 对象
+                    if (results.length === 0) {
+                        const objPattern = /\{\s*"type"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*(?:,\s*"emotion"\s*:\s*"([^"]+)")?\s*\}/g;
+                        let match;
+                        while ((match = objPattern.exec(content)) !== null) {
+                            if (match[1] === 'thinking') continue;
+                            results.push({
+                                content: match[2].replace(/\\"/g, '"').replace(/\\n/g, '\n'),
+                                emotion: match[3] || 'neutral'
+                            });
+                        }
+                        if (results.length > 0) {
+                            console.log(`语音通话容错：正则提取到${results.length}条回复`);
+                        }
+                    }
+                } catch(e2) {
+                    console.warn('语音通话容错解析也失败:', e2.message);
+                }
             }
 
+            // 第四步：兜底 —— 当纯文本处理
             if (results.length === 0) {
-                // fallback: 当纯文本处理
-                const cleaned = trimmed.replace(/^\[?\s*\{[\s\S]*?\}\s*\]?$/, '').trim() || trimmed;
+                console.log('语音通话：未能解析JSON，作为纯文本处理');
+                // 去掉 JSON 残留，提取纯文字
+                let cleaned = trimmed
+                    .replace(/\[?\s*\{[^}]*"type"\s*:\s*"thinking"[^}]*\}\s*,?\s*/g, '')  // 去 thinking 对象
+                    .replace(/[\[\]{}]/g, '')  // 去 JSON 符号
+                    .replace(/"type"\s*:\s*"[^"]*"\s*,?\s*/g, '')
+                    .replace(/"content"\s*:\s*/g, '')
+                    .replace(/"emotion"\s*:\s*"[^"]*"\s*,?\s*/g, '')
+                    .replace(/"/g, '')
+                    .trim();
+                if (!cleaned) cleaned = trimmed;
                 results.push({ content: cleaned, emotion: 'neutral' });
             }
             return results;
@@ -17238,7 +17316,9 @@ ${dialogueText}
             const el = document.getElementById('vcMessages');
             el.innerHTML = vcState.messages.map(m => {
                 const cls = m.role === 'user' ? 'vc-msg-user' : 'vc-msg-assistant';
-                return `<div class="vc-msg ${cls}">${m.content}</div>`;
+                // 助手消息去除拟声词标签（不让用户看到标签文本）
+                const displayContent = m.role === 'assistant' ? stripInterjectionsAlways(m.content) : m.content;
+                return `<div class="vc-msg ${cls}">${displayContent}</div>`;
             }).join('');
             el.scrollTop = el.scrollHeight;
         }
