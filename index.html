@@ -5308,6 +5308,29 @@
             overflow-y: auto;
             font-family: inherit;
         }
+        .vc-mic-btn {
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 50%;
+            background: #e0e0e0;
+            color: #666;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: all 0.2s;
+        }
+        .vc-mic-btn.recording {
+            background: #f44336;
+            color: #fff;
+            animation: vc-mic-pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes vc-mic-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(244,67,54,0.4); }
+            50% { box-shadow: 0 0 0 8px rgba(244,67,54,0); }
+        }
         .vc-send-btn {
             width: 36px;
             height: 36px;
@@ -7061,6 +7084,9 @@
                 <div class="vc-bottom-area">
                     <div class="vc-input-row">
                         <textarea class="vc-input" id="vcInput" placeholder="语音识别中..." rows="1"></textarea>
+                        <button class="vc-mic-btn" id="vcMicBtn" onclick="toggleVcMic()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
+                        </button>
                         <button class="vc-send-btn" id="vcSendBtn" onclick="vcManualSend()" style="display: none;">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
                         </button>
@@ -12175,6 +12201,7 @@ ${memoryText}`;
             targetInput.value = voicePendingText + fullText;
             targetInput.style.height = 'auto';
             targetInput.style.height = Math.min(targetInput.scrollHeight, 120) + 'px';
+            targetInput.scrollTop = targetInput.scrollHeight;
 
             // 讯飞返回 status=2 表示最终结果，把文本合入 pendingText
             if (resp.data.status === 2) {
@@ -12288,6 +12315,7 @@ ${memoryText}`;
                 // 自动调整高度
                 targetInput.style.height = 'auto';
                 targetInput.style.height = Math.min(targetInput.scrollHeight, 120) + 'px';
+                targetInput.scrollTop = targetInput.scrollHeight;
             };
 
             voiceRecognition.onerror = (event) => {
@@ -16594,8 +16622,266 @@ ${dialogueText}
             }
         }
 
-        // ---- 语音识别 ----
+        // ---- 语音识别（讯飞优先，降级 Web Speech API） ----
+        let vcXfWs = null;
+        let vcXfAudioCtx = null;
+        let vcXfMicStream = null;
+        let vcXfProcessor = null;
+        let vcXfSource = null;
+        let vcXfResults = {};
+        let vcXfLastFullText = '';
+
         function startVcRecognition() {
+            if (appData.settings.backendUrl) {
+                startVcXfRecognition();
+            } else {
+                startVcWebSpeechRecognition();
+            }
+        }
+
+        function stopVcRecognition() {
+            clearTimeout(vcState.autoSendTimeout);
+            if (vcState.recognition?.type === 'xfyun') {
+                vcXfCleanupAll();
+            } else if (vcState.recognition) {
+                vcState.recognition.onend = null;
+                vcState.recognition.stop();
+            }
+            vcState.recognition = null;
+            const micBtn = document.getElementById('vcMicBtn');
+            if (micBtn) micBtn.classList.remove('recording');
+        }
+
+        // 麦克风按钮切换
+        function toggleVcMic() {
+            if (vcState.isProcessing) return;
+            if (vcState.recognition) {
+                stopVcRecognition();
+            } else {
+                startVcRecognition();
+            }
+        }
+
+        // ---- 讯飞 STT（语音通话用） ----
+        async function startVcXfRecognition() {
+            vcXfResults = {};
+            vcXfLastFullText = '';
+            vcState.pendingText = '';
+            vcState.processedCount = 0;
+
+            const micBtn = document.getElementById('vcMicBtn');
+            if (micBtn) micBtn.classList.add('recording');
+
+            try {
+                const backendUrl = appData.settings.backendUrl;
+                console.log('语音通话：请求讯飞签名...');
+                const signResp = await fetch(`${backendUrl}/api/stt-sign`);
+                if (!signResp.ok) throw new Error('签名请求失败: ' + signResp.status);
+                const { url, appid } = await signResp.json();
+
+                vcXfMicStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+                });
+
+                vcXfAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                vcXfSource = vcXfAudioCtx.createMediaStreamSource(vcXfMicStream);
+                vcXfProcessor = vcXfAudioCtx.createScriptProcessor(4096, 1, 1);
+
+                vcXfWs = new WebSocket(url);
+                let frameCount = 0;
+
+                vcXfWs.onopen = () => {
+                    console.log('语音通话：讯飞已连接');
+                    vcState.recognition = { type: 'xfyun' };
+
+                    vcXfProcessor.onaudioprocess = (e) => {
+                        if (!vcXfWs || vcXfWs.readyState !== WebSocket.OPEN) return;
+
+                        const float32 = e.inputBuffer.getChannelData(0);
+                        const int16 = xfFloat32ToInt16(float32);
+                        const base64Audio = xfArrayBufferToBase64(int16.buffer);
+
+                        const frame = {
+                            data: {
+                                status: frameCount === 0 ? 0 : 1,
+                                format: 'audio/L16;rate=16000',
+                                encoding: 'raw',
+                                audio: base64Audio
+                            }
+                        };
+
+                        if (frameCount === 0) {
+                            frame.common = { app_id: appid };
+                            frame.business = {
+                                language: 'zh_cn',
+                                domain: 'iat',
+                                accent: 'mandarin',
+                                vad_eos: 60000,
+                                dwa: 'wpgs',
+                                ptt: 1
+                            };
+                        }
+
+                        vcXfWs.send(JSON.stringify(frame));
+                        frameCount++;
+                    };
+
+                    vcXfSource.connect(vcXfProcessor);
+                    vcXfProcessor.connect(vcXfAudioCtx.destination);
+                };
+
+                vcXfWs.onmessage = (event) => {
+                    try {
+                        const resp = JSON.parse(event.data);
+                        if (resp.code !== 0) {
+                            console.error('语音通话：讯飞识别错误:', resp.code, resp.message);
+                            return;
+                        }
+                        vcXfParseResult(resp);
+                    } catch (e) {
+                        console.error('语音通话：讯飞消息解析失败:', e);
+                    }
+                };
+
+                vcXfWs.onclose = () => {
+                    console.log('语音通话：讯飞连接关闭');
+                    // 合并剩余结果
+                    const keys = Object.keys(vcXfResults).map(Number).sort((a, b) => a - b);
+                    const remainText = keys.map(k => vcXfResults[k]).join('');
+                    if (remainText) vcState.pendingText += remainText;
+                    vcXfResults = {};
+
+                    vcXfCleanupAudio();
+
+                    const isActive = document.getElementById('voiceCallActivePage').classList.contains('active');
+                    if (!isActive || !vcState.recognition?.type) return;
+
+                    if (voiceCallData.settings.autoSend) {
+                        // 自动发送模式：60秒到了，有文字就发出去
+                        if (vcState.pendingText.trim()) {
+                            clearTimeout(vcState.autoSendTimeout);
+                            const text = vcState.pendingText.trim();
+                            vcState.pendingText = '';
+                            document.getElementById('vcInput').value = '';
+                            vcAutoResize();
+                            vcState.recognition = null;
+                            const micBtn = document.getElementById('vcMicBtn');
+                            if (micBtn) micBtn.classList.remove('recording');
+                            vcSendUserMessage(text);
+                        } else {
+                            // 没文字，自动重连继续听
+                            vcState.recognition = null;
+                            setTimeout(() => {
+                                if (isActive && !vcState.isProcessing) startVcXfRecognition();
+                            }, 300);
+                        }
+                    } else {
+                        // 手动发送模式：60秒到了就停，图标变灰
+                        vcState.recognition = null;
+                        const micBtn = document.getElementById('vcMicBtn');
+                        if (micBtn) micBtn.classList.remove('recording');
+                        console.log('语音通话：讯飞60秒到期，点击麦克风可继续');
+                    }
+                };
+
+                vcXfWs.onerror = (e) => {
+                    console.error('语音通话：讯飞错误:', e);
+                    vcXfCleanupAll();
+                    vcState.recognition = null;
+                    console.log('语音通话：讯飞不可用，降级到浏览器语音识别');
+                    startVcWebSpeechRecognition();
+                };
+
+            } catch (e) {
+                console.error('语音通话：讯飞启动失败:', e);
+                vcXfCleanupAll();
+                vcState.recognition = null;
+                console.log('语音通话：讯飞启动失败，降级到浏览器语音识别');
+                startVcWebSpeechRecognition();
+            }
+        }
+
+        // 解析语音通话讯飞识别结果
+        function vcXfParseResult(resp) {
+            if (vcState.isProcessing) return;
+
+            const result = resp.data?.result;
+            if (!result) return;
+
+            const sn = result.sn;
+            const pgs = result.pgs;
+
+            let text = '';
+            if (result.ws) {
+                result.ws.forEach(w => { w.cw.forEach(c => { text += c.w; }); });
+            }
+
+            if (pgs === 'rpl' && result.rg) {
+                for (let i = result.rg[0]; i <= result.rg[1]; i++) {
+                    if (i !== sn) delete vcXfResults[i];
+                }
+            }
+
+            vcXfResults[sn] = text;
+
+            const keys = Object.keys(vcXfResults).map(Number).sort((a, b) => a - b);
+            const fullText = keys.map(k => vcXfResults[k]).join('');
+
+            const display = vcState.pendingText + fullText;
+            document.getElementById('vcInput').value = display;
+            vcAutoResize();
+
+            // 自动发送模式：文字变化时重置沉默计时器
+            if (voiceCallData.settings.autoSend && fullText !== vcXfLastFullText) {
+                vcXfLastFullText = fullText;
+                clearTimeout(vcState.autoSendTimeout);
+                if (display.trim()) {
+                    vcState.autoSendTimeout = setTimeout(() => {
+                        if (vcState.recognition?.type === 'xfyun' && !vcState.isProcessing) {
+                            const textToSend = (vcState.pendingText + fullText).trim();
+                            vcState.pendingText = '';
+                            vcXfResults = {};
+                            vcXfLastFullText = '';
+                            document.getElementById('vcInput').value = '';
+                            vcAutoResize();
+                            stopVcRecognition();
+                            vcSendUserMessage(textToSend);
+                        }
+                    }, (voiceCallData.settings.autoSendDelay || 2) * 1000);
+                }
+            }
+
+            // 最终结果合入 pendingText
+            if (resp.data.status === 2) {
+                vcState.pendingText += fullText;
+                vcXfResults = {};
+                vcXfLastFullText = '';
+            }
+        }
+
+        // 清理语音通话讯飞音频资源
+        function vcXfCleanupAudio() {
+            if (vcXfProcessor) { vcXfProcessor.onaudioprocess = null; vcXfProcessor.disconnect(); vcXfProcessor = null; }
+            if (vcXfSource) { vcXfSource.disconnect(); vcXfSource = null; }
+            if (vcXfAudioCtx) { vcXfAudioCtx.close().catch(() => {}); vcXfAudioCtx = null; }
+            if (vcXfMicStream) { vcXfMicStream.getTracks().forEach(t => t.stop()); vcXfMicStream = null; }
+        }
+
+        function vcXfCleanupAll() {
+            if (vcXfWs) {
+                if (vcXfWs.readyState === WebSocket.OPEN) {
+                    try { vcXfWs.send(JSON.stringify({ data: { status: 2, format: 'audio/L16;rate=16000', encoding: 'raw', audio: '' } })); } catch(e) {}
+                }
+                vcXfWs.onclose = null; vcXfWs.onerror = null; vcXfWs.onmessage = null;
+                vcXfWs.close(); vcXfWs = null;
+            }
+            vcXfCleanupAudio();
+            vcXfResults = {};
+            vcXfLastFullText = '';
+        }
+
+        // ---- Web Speech API（语音通话降级方案） ----
+        function startVcWebSpeechRecognition() {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) {
                 alert('您的浏览器不支持语音识别');
@@ -16608,8 +16894,11 @@ ${dialogueText}
             recognition.interimResults = true;
             vcState.recognition = recognition;
 
+            const micBtn = document.getElementById('vcMicBtn');
+            if (micBtn) micBtn.classList.add('recording');
+
             recognition.onresult = (event) => {
-                if (vcState.isProcessing) return; // AI回复中不处理新输入
+                if (vcState.isProcessing) return;
 
                 let interim = '';
                 let finalText = '';
@@ -16630,7 +16919,6 @@ ${dialogueText}
                 document.getElementById('vcInput').value = display;
                 vcAutoResize();
 
-                // 自动发送：有最终文本时重置计时器
                 if (voiceCallData.settings.autoSend && finalText) {
                     clearTimeout(vcState.autoSendTimeout);
                     vcState.autoSendTimeout = setTimeout(() => {
@@ -16647,9 +16935,8 @@ ${dialogueText}
             recognition.onerror = (event) => {
                 console.warn('语音识别错误:', event.error);
                 if (event.error === 'no-speech' || event.error === 'aborted') {
-                    // 自动重启
                     setTimeout(() => {
-                        if (vcState.recognition) {
+                        if (vcState.recognition && !vcState.recognition.type) {
                             try { vcState.recognition.start(); } catch(e) {}
                         }
                     }, 500);
@@ -16657,10 +16944,9 @@ ${dialogueText}
             };
 
             recognition.onend = () => {
-                // 通话未结束则自动重启
                 if (document.getElementById('voiceCallActivePage').classList.contains('active')) {
                     setTimeout(() => {
-                        if (vcState.recognition) {
+                        if (vcState.recognition && !vcState.recognition.type) {
                             try {
                                 vcState.processedCount = 0;
                                 vcState.recognition.start();
@@ -16673,20 +16959,13 @@ ${dialogueText}
             recognition.start();
         }
 
-        function stopVcRecognition() {
-            if (vcState.recognition) {
-                vcState.recognition.onend = null; // 防止自动重启
-                vcState.recognition.stop();
-                vcState.recognition = null;
-            }
-            clearTimeout(vcState.autoSendTimeout);
-        }
-
         // ---- 手动发送 ----
         function vcManualSend() {
             const input = document.getElementById('vcInput');
             const text = input.value.trim();
             if (!text || vcState.isProcessing) return;
+            // 发送时自动断开识别
+            stopVcRecognition();
             vcState.pendingText = '';
             vcState.processedCount = 0;
             input.value = '';
@@ -16796,17 +17075,11 @@ ${dialogueText}
 
             vcState.isProcessing = false;
 
-            // 重启语音识别
+            // 重启语音识别（AI回复完毕后自动恢复听写）
             if (document.getElementById('voiceCallActivePage').classList.contains('active')) {
                 vcState.pendingText = '';
                 vcState.processedCount = 0;
-                if (vcState.recognition) {
-                    try { vcState.recognition.start(); } catch(e) {
-                        startVcRecognition();
-                    }
-                } else {
-                    startVcRecognition();
-                }
+                startVcRecognition();
             }
         }
 
