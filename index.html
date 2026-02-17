@@ -5821,6 +5821,43 @@
                         </div>
                     </div>
                 </div>
+                <div class="settings-section">
+                    <div class="settings-section-title">云端备份 (Supabase)</div>
+                    <div class="settings-card">
+                        <div class="settings-item" style="flex-direction: column; align-items: stretch; gap: 8px;">
+                            <div class="settings-item-left" style="width: 100%;">
+                                <div class="settings-item-icon" style="background: #e8f5e9; color: #388e3c;">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>
+                                </div>
+                                <div>
+                                    <div class="settings-item-text">Supabase 地址</div>
+                                    <div class="settings-item-desc">你的 Supabase 项目 URL</div>
+                                </div>
+                            </div>
+                            <input type="url" class="form-input" id="supabaseUrlInput" placeholder="https://xxxxx.supabase.co" oninput="saveSupabaseConfig()" style="width: 100%; margin-top: 4px; box-sizing: border-box;">
+                        </div>
+                        <div class="settings-item" style="flex-direction: column; align-items: stretch; gap: 8px; margin-top: 12px;">
+                            <div class="settings-item-left" style="width: 100%;">
+                                <div class="settings-item-icon" style="background: #e8f5e9; color: #388e3c;">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                                </div>
+                                <div>
+                                    <div class="settings-item-text">Supabase Key</div>
+                                    <div class="settings-item-desc">项目的 anon public key</div>
+                                </div>
+                            </div>
+                            <input type="text" class="form-input" id="supabaseKeyInput" placeholder="sb_publishable_xxxxx" oninput="saveSupabaseConfig()" style="width: 100%; margin-top: 4px; box-sizing: border-box;">
+                        </div>
+                        <div style="margin-top: 12px; padding: 8px 12px; background: var(--bg-tertiary); border-radius: 8px; font-size: 12px; color: #888;" id="cloudSyncStatus">
+                            未配置
+                        </div>
+                        <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
+                            <button onclick="cloudSyncNow()" style="flex: 1; min-width: 80px; padding: 8px 12px; border: 1px solid #ddd; border-radius: 8px; background: white; font-size: 13px; cursor: pointer;">立即同步</button>
+                            <button onclick="cloudMigrateToCloud()" style="flex: 1; min-width: 80px; padding: 8px 12px; border: 1px solid #ddd; border-radius: 8px; background: white; font-size: 13px; cursor: pointer;">上传到云端</button>
+                            <button onclick="cloudPullFromCloud()" style="flex: 1; min-width: 80px; padding: 8px 12px; border: 1px solid #ddd; border-radius: 8px; background: white; font-size: 13px; cursor: pointer;">从云端恢复</button>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -7408,9 +7445,11 @@
                         saveToLocalStorage();
                     }
                 });
+                if (cloudSyncEnabled()) debouncedPushAppData();
                 return true;
             }
             // 降级到 localStorage
+            if (cloudSyncEnabled()) debouncedPushAppData();
             return saveToLocalStorage();
         }
 
@@ -7492,6 +7531,12 @@
             // 后端地址
             const backendInput = document.getElementById('backendUrlInput');
             if (backendInput) backendInput.value = appData.settings.backendUrl || '';
+            // 云端备份
+            const supabaseUrlInput = document.getElementById('supabaseUrlInput');
+            const supabaseKeyInput = document.getElementById('supabaseKeyInput');
+            if (supabaseUrlInput) supabaseUrlInput.value = appData.settings.supabaseUrl || '';
+            if (supabaseKeyInput) supabaseKeyInput.value = appData.settings.supabaseKey || '';
+            updateCloudSyncStatusDisplay();
             openPage('settingsPage');
         }
 
@@ -7556,6 +7601,351 @@
             appData.settings.backendUrl = url;
             saveData();
         }
+
+        // ==================== 云端同步 (Supabase) ====================
+        let _cloudSyncLastTime = null;
+        let _cloudSyncPushingFlags = { appData: false, wechatData: false, voiceCallData: false };
+        let _cloudSyncTimers = {};
+
+        function cloudSyncEnabled() {
+            return !!(appData.settings.supabaseUrl && appData.settings.supabaseKey);
+        }
+
+        function saveSupabaseConfig() {
+            let url = (document.getElementById('supabaseUrlInput').value || '').trim();
+            if (url.endsWith('/')) url = url.replace(/\/+$/, '');
+            appData.settings.supabaseUrl = url;
+            appData.settings.supabaseKey = (document.getElementById('supabaseKeyInput').value || '').trim();
+            saveData();
+            updateCloudSyncStatusDisplay();
+        }
+
+        // PostgREST 请求封装
+        async function supabaseRequest(method, path, body) {
+            const url = appData.settings.supabaseUrl;
+            const key = appData.settings.supabaseKey;
+            if (!url || !key) throw new Error('Supabase 未配置');
+            const opts = {
+                method,
+                headers: {
+                    'apikey': key,
+                    'Authorization': 'Bearer ' + key,
+                    'Content-Type': 'application/json',
+                    'Prefer': method === 'POST' ? 'resolution=merge-duplicates' : ''
+                }
+            };
+            if (body !== undefined) opts.body = JSON.stringify(body);
+            const resp = await fetch(`${url}/rest/v1/${path}`, opts);
+            if (!resp.ok) {
+                const errText = await resp.text().catch(() => resp.statusText);
+                throw new Error(`Supabase ${resp.status}: ${errText}`);
+            }
+            const contentType = resp.headers.get('content-type') || '';
+            if (contentType.includes('json')) return resp.json();
+            return null;
+        }
+
+        // upsert 一条 key-value
+        async function cloudUpsert(key, value) {
+            return supabaseRequest('POST', 'data_store', {
+                key,
+                value,
+                updated_at: new Date().toISOString()
+            });
+        }
+
+        // 批量 upsert 多条
+        async function cloudUpsertBatch(records) {
+            if (!records.length) return;
+            return supabaseRequest('POST', 'data_store', records);
+        }
+
+        // 读取所有数据（limit=10000 避免默认 1000 条限制）
+        async function cloudFetchAll() {
+            return supabaseRequest('GET', 'data_store?select=key,value,updated_at&limit=10000');
+        }
+
+        // 剥离 base64 图片（微信消息）
+        function cloudStripWechatImages(data) {
+            const stripped = JSON.parse(JSON.stringify(data));
+            for (const assistantId of Object.keys(stripped.conversations || {})) {
+                const conv = stripped.conversations[assistantId];
+                if (conv && conv.messages) {
+                    conv.messages = conv.messages.map(msg => {
+                        if (msg.type === 'image' && msg.content && msg.content.startsWith('data:')) {
+                            return { ...msg, content: '[图片:' + (msg.fileName || 'unknown') + ']' };
+                        }
+                        return msg;
+                    });
+                }
+            }
+            return stripped;
+        }
+
+        // 剥离 base64 附件（API模式消息）
+        function cloudStripApiAttachments(messagesMap) {
+            const stripped = {};
+            for (const convId of Object.keys(messagesMap)) {
+                stripped[convId] = messagesMap[convId].map(msg => {
+                    const m = { ...msg };
+                    // 剥离 attachments 中的 base64 preview
+                    if (m.attachments && m.attachments.length) {
+                        m.attachments = m.attachments.map(att => {
+                            if (att.preview && att.preview.startsWith('data:')) {
+                                return { ...att, preview: '[图片:' + (att.name || 'unknown') + ']' };
+                            }
+                            return att;
+                        });
+                    }
+                    // 剥离 apiContent 中的 base64 图片
+                    if (Array.isArray(m.apiContent)) {
+                        m.apiContent = m.apiContent.map(part => {
+                            if (part.type === 'image_url' && part.image_url && part.image_url.url && part.image_url.url.startsWith('data:')) {
+                                return { type: 'image_url', image_url: { url: '[图片]' } };
+                            }
+                            return part;
+                        });
+                    }
+                    return m;
+                });
+            }
+            return stripped;
+        }
+
+        // 推送 appData 到云端
+        async function pushAppDataToCloud() {
+            if (!cloudSyncEnabled() || _cloudSyncPushingFlags.appData) return;
+            _cloudSyncPushingFlags.appData = true;
+            updateCloudSyncStatusDisplay('syncing');
+            try {
+                const records = [];
+                const now = new Date().toISOString();
+                // 设置
+                records.push({ key: 'app_settings', value: { settings: appData.settings, ttsSettings: appData.ttsSettings }, updated_at: now });
+                // 助手
+                records.push({ key: 'app_assistants', value: appData.assistants, updated_at: now });
+                // 供应商
+                records.push({ key: 'app_providers', value: appData.providers, updated_at: now });
+                // 对话列表 + 当前状态
+                records.push({ key: 'app_conversations', value: { conversations: appData.conversations, currentConversationId: appData.currentConversationId, currentAssistantId: appData.currentAssistantId }, updated_at: now });
+                // 每个对话的消息（剥离图片）
+                const strippedMessages = cloudStripApiAttachments(appData.messages);
+                for (const convId of Object.keys(strippedMessages)) {
+                    records.push({ key: 'app_msgs_' + convId, value: strippedMessages[convId], updated_at: now });
+                }
+                await cloudUpsertBatch(records);
+                _cloudSyncLastTime = new Date();
+                updateCloudSyncStatusDisplay('success');
+                console.log('[云端同步] appData 推送成功，' + records.length + ' 条记录');
+            } catch (e) {
+                console.error('[云端同步] appData 推送失败:', e);
+                updateCloudSyncStatusDisplay('error', e.message);
+            } finally {
+                _cloudSyncPushingFlags.appData = false;
+            }
+        }
+
+        // 推送 wechatData 到云端
+        async function pushWechatDataToCloud() {
+            if (!cloudSyncEnabled() || _cloudSyncPushingFlags.wechatData) return;
+            _cloudSyncPushingFlags.wechatData = true;
+            updateCloudSyncStatusDisplay('syncing');
+            try {
+                const records = [];
+                const now = new Date().toISOString();
+                // 微信状态
+                records.push({ key: 'wechat_state', value: { currentAssistantId: wechatData.currentAssistantId, importedAssistants: wechatData.importedAssistants, pendingMessages: wechatData.pendingMessages || [] }, updated_at: now });
+                // 每个助手的对话（剥离图片）
+                const stripped = cloudStripWechatImages(wechatData);
+                for (const assistantId of Object.keys(stripped.conversations || {})) {
+                    records.push({ key: 'wechat_conv_' + assistantId, value: stripped.conversations[assistantId], updated_at: now });
+                }
+                await cloudUpsertBatch(records);
+                _cloudSyncLastTime = new Date();
+                updateCloudSyncStatusDisplay('success');
+                console.log('[云端同步] wechatData 推送成功，' + records.length + ' 条记录');
+            } catch (e) {
+                console.error('[云端同步] wechatData 推送失败:', e);
+                updateCloudSyncStatusDisplay('error', e.message);
+            } finally {
+                _cloudSyncPushingFlags.wechatData = false;
+            }
+        }
+
+        // 推送 voiceCallData 到云端
+        async function pushVoiceCallDataToCloud() {
+            if (!cloudSyncEnabled() || _cloudSyncPushingFlags.voiceCallData) return;
+            _cloudSyncPushingFlags.voiceCallData = true;
+            updateCloudSyncStatusDisplay('syncing');
+            try {
+                const records = [];
+                const now = new Date().toISOString();
+                records.push({ key: 'vc_settings', value: voiceCallData.settings, updated_at: now });
+                for (const record of (voiceCallData.records || [])) {
+                    records.push({ key: 'vc_record_' + record.id, value: record, updated_at: now });
+                }
+                await cloudUpsertBatch(records);
+                _cloudSyncLastTime = new Date();
+                updateCloudSyncStatusDisplay('success');
+                console.log('[云端同步] voiceCallData 推送成功，' + records.length + ' 条记录');
+            } catch (e) {
+                console.error('[云端同步] voiceCallData 推送失败:', e);
+                updateCloudSyncStatusDisplay('error', e.message);
+            } finally {
+                _cloudSyncPushingFlags.voiceCallData = false;
+            }
+        }
+
+        // 防抖函数
+        function cloudDebounce(fn, key, delay) {
+            return function() {
+                if (_cloudSyncTimers[key]) clearTimeout(_cloudSyncTimers[key]);
+                _cloudSyncTimers[key] = setTimeout(() => { _cloudSyncTimers[key] = null; fn(); }, delay);
+            };
+        }
+
+        const debouncedPushAppData = cloudDebounce(pushAppDataToCloud, 'appData', 10000);
+        const debouncedPushWechatData = cloudDebounce(pushWechatDataToCloud, 'wechatData', 10000);
+        const debouncedPushVoiceCallData = cloudDebounce(pushVoiceCallDataToCloud, 'voiceCallData', 10000);
+
+        // 从云端拉取全部数据并恢复
+        async function cloudPullFromCloud() {
+            if (!cloudSyncEnabled()) { alert('请先配置 Supabase 地址和 Key'); return; }
+            if (!confirm('从云端恢复数据会覆盖当前本地数据，确定要继续吗？')) return;
+            updateCloudSyncStatusDisplay('syncing');
+            try {
+                const rows = await cloudFetchAll();
+                if (!rows || !rows.length) { alert('云端没有找到任何数据'); updateCloudSyncStatusDisplay('success'); return; }
+                const dataMap = {};
+                rows.forEach(r => { dataMap[r.key] = r.value; });
+
+                // 恢复 appData
+                if (dataMap['app_settings']) {
+                    if (dataMap['app_settings'].settings) appData.settings = { ...appData.settings, ...dataMap['app_settings'].settings };
+                    if (dataMap['app_settings'].ttsSettings) appData.ttsSettings = { ...appData.ttsSettings, ...dataMap['app_settings'].ttsSettings };
+                }
+                if (dataMap['app_assistants']) appData.assistants = dataMap['app_assistants'];
+                if (dataMap['app_providers']) appData.providers = dataMap['app_providers'];
+                if (dataMap['app_conversations']) {
+                    appData.conversations = dataMap['app_conversations'].conversations || [];
+                    appData.currentConversationId = dataMap['app_conversations'].currentConversationId;
+                    appData.currentAssistantId = dataMap['app_conversations'].currentAssistantId;
+                }
+                // 恢复消息
+                appData.messages = {};
+                for (const key of Object.keys(dataMap)) {
+                    if (key.startsWith('app_msgs_')) {
+                        const convId = key.replace('app_msgs_', '');
+                        appData.messages[convId] = dataMap[key];
+                    }
+                }
+                saveData();
+
+                // 恢复 wechatData
+                if (dataMap['wechat_state']) {
+                    wechatData.currentAssistantId = dataMap['wechat_state'].currentAssistantId;
+                    wechatData.importedAssistants = dataMap['wechat_state'].importedAssistants || [];
+                    wechatData.pendingMessages = dataMap['wechat_state'].pendingMessages || [];
+                }
+                wechatData.conversations = {};
+                for (const key of Object.keys(dataMap)) {
+                    if (key.startsWith('wechat_conv_')) {
+                        const assistantId = key.replace('wechat_conv_', '');
+                        wechatData.conversations[assistantId] = dataMap[key];
+                    }
+                }
+                saveWechatData();
+
+                // 恢复 voiceCallData
+                if (dataMap['vc_settings']) voiceCallData.settings = { ...voiceCallData.settings, ...dataMap['vc_settings'] };
+                voiceCallData.records = [];
+                for (const key of Object.keys(dataMap)) {
+                    if (key.startsWith('vc_record_')) {
+                        voiceCallData.records.push(dataMap[key]);
+                    }
+                }
+                voiceCallData.records.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+                saveVoiceCallData();
+
+                alert('数据恢复成功！页面将刷新。');
+                location.reload();
+            } catch (e) {
+                console.error('[云端同步] 拉取失败:', e);
+                alert('从云端恢复失败：' + e.message);
+                updateCloudSyncStatusDisplay('error', e.message);
+            }
+        }
+
+        // 一键上传全部本地数据到云端
+        async function cloudMigrateToCloud() {
+            if (!cloudSyncEnabled()) { alert('请先配置 Supabase 地址和 Key'); return; }
+            if (!confirm('将本地所有数据上传到云端（已有的云端数据会被覆盖），确定吗？')) return;
+            updateCloudSyncStatusDisplay('syncing');
+            try {
+                await pushAppDataToCloud();
+                await pushWechatDataToCloud();
+                await pushVoiceCallDataToCloud();
+                alert('上传完成！你的数据已安全备份到云端。');
+            } catch (e) {
+                console.error('[云端同步] 迁移失败:', e);
+                alert('上传失败：' + e.message);
+            }
+        }
+
+        // 立即同步
+        async function cloudSyncNow() {
+            if (!cloudSyncEnabled()) { alert('请先配置 Supabase 地址和 Key'); return; }
+            // 取消所有防抖计时器
+            for (const key of Object.keys(_cloudSyncTimers)) {
+                if (_cloudSyncTimers[key]) { clearTimeout(_cloudSyncTimers[key]); _cloudSyncTimers[key] = null; }
+            }
+            try {
+                await pushAppDataToCloud();
+                await pushWechatDataToCloud();
+                await pushVoiceCallDataToCloud();
+            } catch (e) {
+                console.error('[云端同步] 手动同步失败:', e);
+            }
+        }
+
+        // 同步状态显示
+        function updateCloudSyncStatusDisplay(status, detail) {
+            const el = document.getElementById('cloudSyncStatus');
+            if (!el) return;
+            if (!cloudSyncEnabled()) {
+                el.textContent = '未配置';
+                el.style.color = '#888';
+                return;
+            }
+            if (status === 'syncing') {
+                el.textContent = '同步中...';
+                el.style.color = '#1976d2';
+            } else if (status === 'success') {
+                const timeStr = _cloudSyncLastTime ? _cloudSyncLastTime.toLocaleTimeString('zh-CN') : '--';
+                el.textContent = '最后同步: ' + timeStr;
+                el.style.color = '#388e3c';
+            } else if (status === 'error') {
+                el.textContent = '同步失败' + (detail ? ': ' + detail.substring(0, 50) : '');
+                el.style.color = '#d32f2f';
+            } else {
+                el.textContent = '已配置，等待同步';
+                el.style.color = '#888';
+            }
+        }
+
+        // 页面切出时立即同步
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden && cloudSyncEnabled()) {
+                // 取消防抖，立即推送
+                for (const key of Object.keys(_cloudSyncTimers)) {
+                    if (_cloudSyncTimers[key]) { clearTimeout(_cloudSyncTimers[key]); _cloudSyncTimers[key] = null; }
+                }
+                pushAppDataToCloud();
+                pushWechatDataToCloud();
+                pushVoiceCallDataToCloud();
+            }
+        });
+        // ==================== 云端同步结束 ====================
 
         // 保存副模型
         function saveGlobalSecondaryModel() {
@@ -10350,9 +10740,11 @@
                         saveWechatToLocalStorage();
                     }
                 });
+                if (cloudSyncEnabled()) debouncedPushWechatData();
                 return true;
             }
             // 降级到 localStorage
+            if (cloudSyncEnabled()) debouncedPushWechatData();
             return saveWechatToLocalStorage();
         }
 
@@ -16404,9 +16796,11 @@ ${dialogueText}
                         try { localStorage.setItem('miaomiao_voicecall_v1', JSON.stringify(voiceCallData)); } catch(e) {}
                     }
                 });
+                if (cloudSyncEnabled()) debouncedPushVoiceCallData();
                 return;
             }
             try { localStorage.setItem('miaomiao_voicecall_v1', JSON.stringify(voiceCallData)); } catch(e) {}
+            if (cloudSyncEnabled()) debouncedPushVoiceCallData();
         }
 
         // 保存音频Blob到IndexedDB
