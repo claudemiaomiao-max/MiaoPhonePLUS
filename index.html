@@ -16437,11 +16437,11 @@ ${dialogueText}
         }
 
         // ---- 打开语音通话模式 ----
-        function openVoiceCallMode() {
-            loadVoiceCallData().then(() => {
-                renderVcContactList();
-                openPage('voiceCallPage');
-            });
+        async function openVoiceCallMode() {
+            await loadVoiceCallData();
+            await initWechatData();  // 确保微信聊天数据已加载（语音通话可能携带微信上下文）
+            renderVcContactList();
+            openPage('voiceCallPage');
         }
 
         // ---- 渲染通讯录 ----
